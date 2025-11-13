@@ -1,0 +1,2 @@
+# HarmoniaChatroom__WeChatmini
+一个dev是gpt5-codex的聊天室项目，可部署在infinityfree.com所提供的免费空间里，支持管理员/登陆注册/封禁等功能
