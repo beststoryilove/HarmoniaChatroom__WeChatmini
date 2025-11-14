@@ -1,6 +1,5 @@
 <?php
 // combined_poll.php
-// 合并轮询：更新在线心跳 + 拉取新消息(北京时间) + 在线用户列表(可选)
 require_once __DIR__ . '/functions.php';
 require_login();
 
@@ -23,9 +22,9 @@ if (session_status() === PHP_SESSION_ACTIVE) {
 
 header('Content-Type: application/json');
 
-$last_id = isset($_GET['last_id']) ? (int)$_GET['last_id'] : 0;
-// no_users=1 时不查询在线用户，减轻数据库负担
-$noUsers = isset($_GET['no_users']) ? (int)$_GET['no_users'] : 0;
+$last_id  = isset($_GET['last_id']) ? (int)$_GET['last_id'] : 0;
+$noUsers  = isset($_GET['no_users']) ? (int)$_GET['no_users'] : 0;
+$noMsgs   = isset($_GET['no_msgs'])  ? (int)$_GET['no_msgs']  : 0; // 新增：跳过消息查询
 $sec = (int)ONLINE_WINDOW_SECONDS;
 
 try {
@@ -38,7 +37,7 @@ try {
             ->execute([$uid, $token]);
     }
 
-    // 二次校验：如 DB 中存在与当前 token 不同的活跃会话，则让本会话失效
+    // 二次校验：发现别处活跃会话则冲突
     $stmt = $pdo->prepare("
         SELECT active_session,
                (active_session IS NOT NULL AND active_session_updated IS NOT NULL
@@ -56,28 +55,31 @@ try {
         }
     }
 
-    // 2) 拉新消息（北京时间）
-    $stmt = $pdo->prepare("
-        SELECT m.id, u.username, u.is_admin, m.content,
-               DATE_FORMAT(CONVERT_TZ(m.created_at, @@session.time_zone, '+08:00'), '%Y-%m-%d %H:%i:%s') AS time_cst
-        FROM messages m
-        JOIN users u ON u.id = m.user_id
-        WHERE m.id > ?
-        ORDER BY m.id ASC
-        LIMIT " . (int)FETCH_LIMIT
-    );
-    $stmt->execute([$last_id]);
-    $rows = $stmt->fetchAll();
+    // 2) 消息（按需；长轮询负责消息，这里默认跳过）
+    $messages = null;
+    if (!$noMsgs) {
+        $stmt = $pdo->prepare("
+            SELECT m.id, u.username, u.is_admin, m.content,
+                   DATE_FORMAT(CONVERT_TZ(m.created_at, @@session.time_zone, '+08:00'), '%Y-%m-%d %H:%i:%s') AS time_cst
+            FROM messages m
+            JOIN users u ON u.id = m.user_id
+            WHERE m.id > ?
+            ORDER BY m.id ASC
+            LIMIT " . (int)FETCH_LIMIT
+        );
+        $stmt->execute([$last_id]);
+        $rows = $stmt->fetchAll();
 
-    $messages = [];
-    foreach ($rows as $r) {
-        $messages[] = [
-            'id'       => (int)$r['id'],
-            'username' => $r['username'],
-            'is_admin' => ((int)$r['is_admin'] === 1),
-            'content'  => $r['content'],
-            'time'     => $r['time_cst'] ?: date('Y-m-d H:i:s'),
-        ];
+        $messages = [];
+        foreach ($rows as $r) {
+            $messages[] = [
+                'id'       => (int)$r['id'],
+                'username' => $r['username'],
+                'is_admin' => ((int)$r['is_admin'] === 1),
+                'content'  => $r['content'],
+                'time'     => $r['time_cst'] ?: date('Y-m-d H:i:s'),
+            ];
+        }
     }
 
     // 3) 在线用户列表（按需）
