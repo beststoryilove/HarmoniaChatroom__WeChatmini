@@ -2,14 +2,9 @@
 // room.php
 require_once __DIR__ . '/functions.php';
 require_login();
-// 封禁在 combined_poll.php 中统一拦截，这里不再检查
 
 $user = fetch_user_by_id(current_user_id());
-if (!$user) {
-    clear_session();
-    header('Location: login.php');
-    exit;
-}
+if (!$user) { clear_session(); header('Location: login.php'); exit; }
 ?>
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -94,30 +89,24 @@ if (!$user) {
 const currentUser = <?php echo json_encode($user['username']); ?>;
 const isAdmin = <?php echo $user['is_admin'] ? 'true' : 'false'; ?>;
 
-// 自适应轮询：突发快轮询 + 可选跳过在线列表
-const POLL_FAST = 600;
-const POLL_SLOW = 2800;
-const POLL_BACKOFF = 12000;
-const USER_POLL_EVERY = 3;
-const USERS_MIN_INTERVAL = 10000; // 至少每10s查一次在线列表
+// 在线刷新节奏
+const USERS_INTERVAL = 5000;     // 定时刷新：5s
+const USERS_MIN_INTERVAL = 3000; // 触发式最小间隔：3s
 
 let lastId = 0;
-let fetching = false;
-let pollTimer = null;
+let localMsgVer = null;   // 本地消息版本（用于与服务器比对）
+let stopping = false;     // 页面关闭时停止长轮询
 
-// 突发与在线节奏控制
-let burst = 0;
-let pollSeq = 0;
-let firstUsers = true;
+// 在线刷新状态
 let lastUsersTs = 0;
+let usersFetching = false;
 
-// 去重与临时消息
-const renderedIds = new Set();
-const tempSent = new Map();
+const renderedIds = new Set();   // 已渲染消息去重
+const tempSent = new Map();      // 临时发送中的消息 cid -> DOM
 
-function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 
-function appendMessage(m) {
+function appendMessage(m){
   if (m.id && renderedIds.has(m.id)) return;
   const wrap = document.createElement('div');
   if (m.id) { wrap.id = 'msg-' + m.id; renderedIds.add(m.id); }
@@ -137,52 +126,35 @@ function appendMessage(m) {
   document.getElementById('messages').appendChild(wrap);
   if (m._cid && m._temp) tempSent.set(m._cid, wrap);
 }
-
-function scrollToBottom() {
+function scrollToBottom(){ const box=document.getElementById('messages'); box.scrollTop=box.scrollHeight; }
+function clearMessagesUIAndState(){
   const box = document.getElementById('messages');
-  box.scrollTop = box.scrollHeight;
+  while (box.firstChild) box.removeChild(box.firstChild);
+  renderedIds.clear();
+  tempSent.clear();
+  lastId = 0;
 }
 
-function schedulePoll(ms) {
-  if (pollTimer) clearTimeout(pollTimer);
-  pollTimer = setTimeout(poll, ms);
-}
-
-async function poll() {
-  if (fetching) return;
-  fetching = true;
+// 长轮询：近实时获取新消息/版本变化
+async function longPoll() {
+  if (stopping) return;
   try {
-    // 决定是否查在线列表
-    let wantUsers = false;
-    const dueByTime = (Date.now() - lastUsersTs) >= USERS_MIN_INTERVAL;
+    const url = 'long_poll.php?last_id=' + encodeURIComponent(lastId) + '&ver=' + encodeURIComponent(localMsgVer || '');
+    const res = await fetch(url, {cache:'no-store'});
+    if (res.status === 403) { location.href='banned.php'; return; }
+    if (res.status === 409) { location.href='login.php?conflict=1'; return; } // 保险处理
+    const text = await res.text();
+    let data; try { data = JSON.parse(text); } catch { setTimeout(longPoll, 1000); return; }
 
-    if (firstUsers) {
-      wantUsers = true;
-      firstUsers = false;
-    } else if (burst > 0 && !dueByTime) {
-      wantUsers = false;
-      burst--;
-    } else if (dueByTime) {
-      wantUsers = true;
-    } else {
-      pollSeq++;
-      wantUsers = (pollSeq % USER_POLL_EVERY === 0);
+    if (data.messages_version) localMsgVer = String(data.messages_version);
+
+    if (data.reset) {
+      clearMessagesUIAndState(); // 管理员清空等
     }
 
-    const url = 'combined_poll.php?last_id=' + encodeURIComponent(lastId) + (wantUsers ? '' : '&no_users=1');
-    const res = await fetch(url, {cache:'no-store'});
-
-    if (res.status === 403) { location.href = 'banned.php'; return; }
-    if (res.status === 409) { location.href = 'login.php?conflict=1'; return; }
-
-    const text = await res.text();
-    let data; try { data = JSON.parse(text); } catch { console.warn('poll non-JSON:', text); schedulePoll(POLL_BACKOFF); return; }
-    if (data.error === 'db_busy') { schedulePoll(POLL_BACKOFF); return; }
-
-    // 消息
-    let got = 0;
-    if (Array.isArray(data.messages)) {
+    if (Array.isArray(data.messages) && data.messages.length > 0) {
       data.messages.forEach(m => {
+        // 将临时消息“转正”
         let merged = false;
         if (m.username === currentUser && tempSent.size > 0) {
           for (const [cid, node] of tempSent) {
@@ -190,37 +162,45 @@ async function poll() {
             if (textEl && textEl.textContent === m.content) {
               node.classList.remove('temp'); node.dataset.cid = ''; node.id = 'msg-' + m.id;
               const timeEl = node.querySelector('.time'); if (timeEl && m.time) timeEl.textContent = m.time;
-              tempSent.delete(cid); renderedIds.add(m.id);
-              merged = true; break;
+              tempSent.delete(cid); renderedIds.add(m.id); merged = true; break;
             }
           }
         }
         if (!merged) appendMessage(m);
         if (m.id) lastId = Math.max(lastId, m.id);
-        got++;
       });
-      if (got > 0) scrollToBottom();
+      scrollToBottom();
+      refreshUsersSoon(); // 新消息到达时，尝试加急刷新在线列表
     }
 
-    // 在线
+    setTimeout(longPoll, 10); // 继续下一轮长轮询
+  } catch (e) {
+    setTimeout(longPoll, 1500); // 网络/主机繁忙 → 退避
+  }
+}
+
+// 心跳 + 在线列表（带节流）
+async function heartbeatUsers(force = false) {
+  if (!force && (Date.now() - lastUsersTs) < USERS_MIN_INTERVAL) return;
+  if (usersFetching) return;
+  usersFetching = true;
+  try {
+    const res = await fetch('combined_poll.php?no_msgs=1', {cache:'no-store'});
+    if (res.status === 403) { location.href='banned.php'; return; }
+    if (res.status === 409) { location.href='login.php?conflict=1'; return; }
+    const data = await res.json();
     if (Array.isArray(data.users)) {
       renderOnline(data.users);
       lastUsersTs = Date.now();
     }
-
-    if (got > 0) {
-      burst = Math.max(burst, 5);
-      schedulePoll(POLL_FAST);
-    } else {
-      schedulePoll(POLL_SLOW);
-    }
   } catch (e) {
-    console.warn('poll error', e);
-    schedulePoll(POLL_BACKOFF);
+    // 忽略单次失败
   } finally {
-    fetching = false;
+    usersFetching = false;
   }
 }
+function refreshUsersSoon() { heartbeatUsers(true); }     // 触发式刷新在线
+setInterval(() => heartbeatUsers(false), USERS_INTERVAL); // 定时刷新在线
 
 async function sendMessage() {
   const input = document.getElementById('msgInput');
@@ -228,6 +208,7 @@ async function sendMessage() {
   if (!content) return;
   input.value = '';
 
+  // 乐观追加
   const cid = 'c' + Date.now() + Math.random().toString(36).slice(2);
   appendMessage({ _cid: cid, _temp: true, username: currentUser, is_admin: isAdmin, content, time: new Date().toLocaleString() });
   scrollToBottom();
@@ -242,22 +223,21 @@ async function sendMessage() {
 
   const txt = await res.text(); let data; try { data = JSON.parse(txt); } catch {
     const node = tempSent.get(cid); if (node){ node.style.opacity='0.6'; node.style.filter='grayscale(1)'; const t=node.querySelector('.time'); if (t) t.textContent='发送失败'; tempSent.delete(cid);}
-    alert('发送返回非JSON：'+txt.slice(0,120)); return;
+    alert('发送返回非JSON：' + txt.slice(0,120)); return;
   }
-
   if (data.error){
     const node = tempSent.get(cid);
     if (node){ node.style.opacity='0.6'; node.style.filter='grayscale(1)'; const t=node.querySelector('.time'); if (t) t.textContent=data.error; tempSent.delete(cid); }
     alert(data.error);
-  } else if (data.info){
-    appendMessage({id:lastId, username:'系统', is_admin:false, content:data.info, time:new Date().toLocaleString()});
+  } else if (data.info) {
+    // 管理员命令反馈（例如清空等）
+    appendMessage({username:'系统', is_admin:false, content:data.info, time:new Date().toLocaleString()});
     scrollToBottom();
     const node = tempSent.get(cid); if (node){ node.remove(); tempSent.delete(cid); }
-    burst = Math.max(burst, 5);
-    schedulePoll(POLL_FAST);
-  } else if (data.ok){
-    burst = Math.max(burst, 5);
-    schedulePoll(POLL_FAST);
+    refreshUsersSoon();
+  } else if (data.ok) {
+    // 等待长轮询“转正”；顺带尝试刷新在线
+    refreshUsersSoon();
   }
 }
 
@@ -270,7 +250,10 @@ const onlineCountHeader = document.getElementById('onlineCountHeader');
 const onlineCountDrawer = document.getElementById('onlineCountDrawer');
 const onlineList = document.getElementById('onlineList');
 
-function openOverlay(){ overlay.classList.add('open'); }
+function openOverlay(){ 
+  refreshUsersSoon(); // 打开面板先刷新一次
+  overlay.classList.add('open'); 
+}
 function closeOverlay(){ overlay.classList.remove('open'); if (!overlay.classList.contains('open')){ overlay.style.display='none'; setTimeout(()=>{overlay.style.display='';},0);} }
 if (onlineBtn) onlineBtn.addEventListener('click', openOverlay);
 if (backdrop) backdrop.addEventListener('click', closeOverlay);
@@ -294,7 +277,7 @@ function renderLinkified(el, s) {
   if (last < s.length) el.appendChild(document.createTextNode(s.slice(last)));
 }
 
-// 公告弹窗（支持 URL）
+// 公告弹窗
 async function checkAnnouncement() {
   try {
     const res = await fetch('get_announcement.php', {cache:'no-store'});
@@ -316,7 +299,6 @@ async function checkAnnouncement() {
     const openBtn = document.getElementById('noticeOpen');
 
     renderLinkified(body, text);
-
     if (url && /^https?:\/\//i.test(url)) {
       openBtn.style.display = '';
       openBtn.href = url;
@@ -334,15 +316,14 @@ async function checkAnnouncement() {
   } catch (e) {}
 }
 
-function renderOnline(users){
+function renderOnline(users) {
   const n = users.length;
   onlineCountHeader.textContent = n;
   onlineCountDrawer.textContent = n;
   onlineList.innerHTML = '';
   users.forEach(u => {
     const li = document.createElement('li');
-    const left = document.createElement('span');
-    left.className = 'name';
+    const left = document.createElement('span'); left.className = 'name';
     left.textContent = u.username + (u.is_admin ? '（管理员）' : '') + (u.me ? '（我）' : '');
     li.appendChild(left);
 
@@ -351,10 +332,7 @@ function renderOnline(users){
     right.appendChild(tag);
 
     if (isAdmin && !u.is_admin && !u.me) {
-      const banBtn = document.createElement('button');
-      banBtn.className = 'btn-ban';
-      banBtn.textContent = '封禁...';
-      banBtn.title = '发起封禁（将预填命令）';
+      const banBtn = document.createElement('button'); banBtn.className = 'btn-ban'; banBtn.textContent = '封禁...'; banBtn.title = '发起封禁';
       banBtn.addEventListener('click', () => {
         const reason = prompt('请输入封禁原因：', '违反规定'); if (reason === null) return;
         const days = prompt('封禁天数（整数）：', '1'); if (days === null) return;
@@ -364,7 +342,6 @@ function renderOnline(users){
       });
       right.appendChild(banBtn);
     }
-
     li.appendChild(right);
     onlineList.appendChild(li);
   });
@@ -372,6 +349,7 @@ function renderOnline(users){
 
 // 离开页面尝试释放会话
 window.addEventListener('beforeunload', () => {
+  stopping = true;
   try {
     if (navigator.sendBeacon) {
       const blob = new Blob([], {type: 'application/x-www-form-urlencoded'});
@@ -382,23 +360,23 @@ window.addEventListener('beforeunload', () => {
   } catch (e) {}
 });
 
-// 页面可见性改变：重新可见时触发快轮询
+// 页面从后台回到前台：重启长轮询、刷新在线
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) {
-    burst = Math.max(burst, 5);
-    schedulePoll(50);
+  if (!document.hidden && !stopping) {
+    setTimeout(longPoll, 50);
+    refreshUsersSoon();
   }
 });
 
-// 启动
-poll();
+// 启动：长轮询 + 在线定时心跳 + 公告 + 立刻刷新一次在线
+longPoll();
+setInterval(heartbeatUsers, USERS_INTERVAL);
 checkAnnouncement();
+refreshUsersSoon();
 
 // 发送事件绑定
 document.getElementById('sendBtn').addEventListener('click', sendMessage);
-document.getElementById('msgInput').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') sendMessage();
-});
+document.getElementById('msgInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendMessage(); });
 </script>
 </body>
 </html>
